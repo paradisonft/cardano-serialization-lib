@@ -621,6 +621,18 @@ impl Redeemers {
     }
 }
 
+impl Redeemers {
+    pub fn tot_ex_units(&self) -> Result<ExUnits,JsError> {
+        let mut mem = BigNum::from_str("0")?;
+        let mut step = BigNum::from_str("0")?;
+        for redeemer in &self.0 {
+            mem = mem.checked_add(&redeemer.ex_units().mem())?;
+            step = step.checked_add(&redeemer.ex_units().steps())?;
+        }
+        Ok(ExUnits::new(&mem, &step))
+    }
+}
+
 impl From<Vec<Redeemer>> for Redeemers {
     fn from(values: Vec<Redeemer>) -> Self {
         Self(values)

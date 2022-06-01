@@ -114,7 +114,7 @@ fn fake_full_tx(tx_builder: &TransactionBuilder, body: TransactionBody) -> Resul
             let (s, d, r) = s.collect();
             (Some(s), Some(d), Some(r))
         } else {
-            (None, None, None)
+            (tx_builder.plutus_scripts.clone(), tx_builder.plutus_data.clone(), tx_builder.redeemers.clone())
         }
     };
     let witness_set = TransactionWitnessSet {
@@ -164,7 +164,7 @@ fn min_fee(tx_builder: &TransactionBuilder) -> Result<Coin, JsError> {
     //     assert_required_mint_scripts(mint, tx_builder.mint_scripts.as_ref())?;
     // }
     let full_tx = fake_full_tx(tx_builder, tx_builder.build()?)?;
-    fees::min_fee(&full_tx, &tx_builder.config.fee_algo)
+    fees::min_fee(&full_tx, &tx_builder.config.fee_algo, tx_builder.config.price_mem, tx_builder.config.price_step)
 }
 
 
@@ -292,6 +292,8 @@ pub struct TransactionBuilderConfig {
     key_deposit: BigNum,       // protocol parameter
     max_value_size: u32,       // protocol parameter
     max_tx_size: u32,          // protocol parameter
+    price_mem: f64,            // protocol parameter
+    price_step: f64,           // protocol parameter
     coins_per_utxo_word: Coin, // protocol parameter
     prefer_pure_change: bool,
 }
@@ -304,6 +306,8 @@ pub struct TransactionBuilderConfigBuilder {
     key_deposit: Option<BigNum>,       // protocol parameter
     max_value_size: Option<u32>,       // protocol parameter
     max_tx_size: Option<u32>,          // protocol parameter
+    price_mem: Option<f64>,            // protocol parameter
+    price_step: Option<f64>,           // protocol parameter
     coins_per_utxo_word: Option<Coin>, // protocol parameter
     prefer_pure_change: bool,
 }
@@ -317,6 +321,8 @@ impl TransactionBuilderConfigBuilder {
             key_deposit: None,
             max_value_size: None,
             max_tx_size: None,
+            price_mem: None,
+            price_step: None,
             coins_per_utxo_word: None,
             prefer_pure_change: false,
         }
@@ -358,6 +364,18 @@ impl TransactionBuilderConfigBuilder {
         cfg
     }
 
+    pub fn price_mem(&self, price_mem: f64) -> Self {
+        let mut cfg = self.clone();
+        cfg.price_mem = Some(price_mem);
+        cfg
+    }
+
+    pub fn price_step(&self, price_step: f64) -> Self {
+        let mut cfg = self.clone();
+        cfg.price_step = Some(price_step);
+        cfg
+    }
+
     pub fn prefer_pure_change(&self, prefer_pure_change: bool) -> Self {
         let mut cfg = self.clone();
         cfg.prefer_pure_change = prefer_pure_change;
@@ -372,6 +390,8 @@ impl TransactionBuilderConfigBuilder {
             key_deposit: cfg.key_deposit.ok_or(JsError::from_str("uninitialized field: key_deposit"))?,
             max_value_size: cfg.max_value_size.ok_or(JsError::from_str("uninitialized field: max_value_size"))?,
             max_tx_size: cfg.max_tx_size.ok_or(JsError::from_str("uninitialized field: max_tx_size"))?,
+            price_mem: cfg.price_mem.ok_or(JsError::from_str("uninitialized field: price_mem"))?,
+            price_step: cfg.price_step.ok_or(JsError::from_str("uninitialized field: price_step"))?,
             coins_per_utxo_word: cfg.coins_per_utxo_word.ok_or(JsError::from_str("uninitialized field: coins_per_utxo_word"))?,
             prefer_pure_change: cfg.prefer_pure_change,
         })
@@ -388,6 +408,11 @@ pub struct TransactionBuilder {
     ttl: Option<SlotBigNum>, // absolute slot number
     certs: Option<Certificates>,
     withdrawals: Option<Withdrawals>,
+    collateral: Option<TransactionInputs>,
+    required_signers: Option<Ed25519KeyHashes>,
+    plutus_data: Option<PlutusList>,
+    redeemers: Option<Redeemers>,
+    plutus_scripts: Option<PlutusScripts>,
     auxiliary_data: Option<AuxiliaryData>,
     validity_start_interval: Option<SlotBigNum>,
     input_types: MockWitnessSet,
@@ -1117,6 +1142,35 @@ impl TransactionBuilder {
         )
     }
 
+    pub fn set_collateral(&mut self, collateral: &TransactionInputs) {
+        self.collateral = Some(collateral.clone())
+    }
+
+    pub fn set_plutus_data(&mut self, plutus_data: &PlutusList) {
+        self.plutus_data = Some(plutus_data.clone());
+    }
+
+    pub fn set_redeemers(&mut self, redeemers: &Redeemers) {
+        self.redeemers = Some(redeemers.clone())
+    }
+
+    pub fn set_plutus_scripts(&mut self, plutus_scripts: &PlutusScripts) {
+        self.plutus_scripts = Some(plutus_scripts.clone())
+    }
+
+    pub fn set_required_signers(&mut self, required_signers: &Ed25519KeyHashes) {
+        self.required_signers = Some(required_signers.clone());
+        for required_signer in &required_signers.0 {
+            self.input_types.vkeys.insert(required_signer.clone());
+        };
+    }
+
+    pub fn index_of_input(&self, input: &TransactionInput) -> usize {
+        let mut inputs = self.inputs.iter().map(|(TxBuilderInput {input, .. },_)| input.clone()).collect::<Vec<TransactionInput>>();
+        inputs.sort();
+        inputs.iter().position(|i| i == input).unwrap()
+    }
+
     pub fn new(cfg: &TransactionBuilderConfig) -> Self {
         Self {
             config: cfg.clone(),
@@ -1126,6 +1180,11 @@ impl TransactionBuilder {
             ttl: None,
             certs: None,
             withdrawals: None,
+            collateral: None,
+            required_signers: None,
+            plutus_data: None,
+            redeemers: None,
+            plutus_scripts: None,
             auxiliary_data: None,
             input_types: MockWitnessSet {
                 vkeys: BTreeSet::new(),
@@ -1471,6 +1530,13 @@ impl TransactionBuilder {
         }
     }
 
+    pub fn calc_script_data_hash2(&mut self, cost_models: &Costmdls) {
+        self.script_data_hash = match &self.redeemers {
+            None => None,
+            Some(_) => Some(hash_script_data(&self.redeemers.clone().unwrap(), cost_models, self.plutus_data.clone()))
+        };
+    }
+
     /// Sets the specified hash value.
     /// Alternatively you can use `.calc_script_data_hash` to calculate the hash automatically.
     /// Or use `.remove_script_data_hash` to delete the previously set value
@@ -1503,8 +1569,8 @@ impl TransactionBuilder {
             validity_start_interval: self.validity_start_interval,
             mint: self.mint.clone(),
             script_data_hash: self.script_data_hash.clone(),
-            collateral: None,
-            required_signers: None,
+            collateral: self.collateral.clone(),
+            required_signers: self.required_signers.clone(),
             network_id: None,
         };
         // we must build a tx with fake data (of correct size) to check the final Transaction size
@@ -1616,6 +1682,9 @@ mod tests {
     // this is what is used in mainnet
     static COINS_PER_UTXO_WORD: u64 = 34_482;
 
+    const PRICE_MEM: f64 = 0.0;
+    const PRICE_STEPS: f64 = 0.0;
+
     fn genesis_id() -> TransactionHash {
         TransactionHash::from([0u8; TransactionHash::BYTE_COUNT])
     }
@@ -1676,6 +1745,8 @@ mod tests {
             .key_deposit(&to_bignum(key_deposit))
             .max_value_size(max_val_size)
             .max_tx_size(MAX_TX_SIZE)
+            .price_mem(PRICE_MEM)
+            .price_step(PRICE_STEPS)
             .coins_per_utxo_word(&to_bignum(coins_per_utxo_word))
             .build()
             .unwrap();
@@ -1715,6 +1786,8 @@ mod tests {
             .key_deposit(&to_bignum(1))
             .max_value_size(MAX_VALUE_SIZE)
             .max_tx_size(MAX_TX_SIZE)
+            .price_mem(PRICE_MEM)
+            .price_step(PRICE_STEPS)
             .coins_per_utxo_word(&to_bignum(1))
             .prefer_pure_change(true)
             .build()
@@ -3397,6 +3470,8 @@ mod tests {
             .key_deposit(&to_bignum(0))
             .max_value_size(9999)
             .max_tx_size(9999)
+            .price_mem(PRICE_MEM)
+            .price_step(PRICE_STEPS)
             .coins_per_utxo_word(&Coin::zero())
             .build()
             .unwrap();
@@ -3427,6 +3502,8 @@ mod tests {
             .key_deposit(&to_bignum(0))
             .max_value_size(9999)
             .max_tx_size(9999)
+            .price_mem(PRICE_MEM)
+            .price_step(PRICE_STEPS)
             .coins_per_utxo_word(&Coin::zero())
             .build()
             .unwrap();
@@ -3671,6 +3748,8 @@ mod tests {
                 .key_deposit(&to_bignum(0))
                 .max_value_size(max_value_size)
                 .max_tx_size(MAX_TX_SIZE)
+                .price_mem(PRICE_MEM)
+                .price_step(PRICE_STEPS)
                 .coins_per_utxo_word(&to_bignum(1))
                 .prefer_pure_change(true)
                 .build()
