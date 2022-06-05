@@ -404,6 +404,7 @@ pub struct TransactionBuilder {
     config: TransactionBuilderConfig,
     inputs: Vec<(TxBuilderInput, Option<ScriptHash>)>,
     outputs: TransactionOutputs,
+    change_output_indices: Vec<usize>,
     fee: Option<Coin>,
     ttl: Option<SlotBigNum>, // absolute slot number
     certs: Option<Certificates>,
@@ -911,6 +912,34 @@ impl TransactionBuilder {
         }
     }
 
+    pub fn add_change_output(&mut self, output: &TransactionOutput) -> Result<(), JsError> {
+        let value_size = output.amount.to_bytes().len();
+        if value_size > self.config.max_value_size as usize {
+            return Err(JsError::from_str(&format!(
+                "Maximum value size of {} exceeded. Found: {}",
+                self.config.max_value_size,
+                value_size
+            )));
+        }
+        let min_ada = min_ada_required(
+            &output.amount(),
+            output.data_hash.is_some(),
+            &self.config.coins_per_utxo_word,
+        )?;
+        if output.amount().coin() < min_ada {
+            Err(JsError::from_str(&format!(
+                "Value {} less than the minimum UTXO value {}",
+                from_bignum(&output.amount().coin()),
+                from_bignum(&min_ada)
+            )))
+        } else {
+            self.outputs.add(output);
+            let outputs_length = self.outputs.len();
+            self.change_output_indices.push(outputs_length - 1);
+            Ok(())
+        }
+    }
+
     /// calculates how much the fee would increase if you added a given output
     pub fn fee_for_output(&self, output: &TransactionOutput) -> Result<Coin, JsError> {
         let mut self_copy = self.clone();
@@ -1176,6 +1205,7 @@ impl TransactionBuilder {
             config: cfg.clone(),
             inputs: Vec::new(),
             outputs: TransactionOutputs::new(),
+            change_output_indices: Vec::new(),
             fee: None,
             ttl: None,
             certs: None,
@@ -1268,15 +1298,12 @@ impl TransactionBuilder {
     /// Editing inputs, outputs, mint, etc. after change been calculated
     /// might cause a mismatch in calculated fee versus the required fee
     pub fn add_change_if_needed(&mut self, address: &Address) -> Result<bool, JsError> {
-        let fee = match &self.fee {
-            None => self.min_fee(),
-            // generating the change output involves changing the fee
-            Some(_x) => {
-                return Err(JsError::from_str(
-                    "Cannot calculate change if fee was explicitly specified",
-                ))
-            }
-        }?;
+        // reset change outputs
+        for index in self.change_output_indices.iter() {
+            self.outputs.0.remove(*index);
+        }
+        self.change_output_indices = Vec::new();
+        let fee = self.min_fee()?;
 
         // note: can't add data_hash to change
         // because we don't know how many change outputs will need to be created
@@ -1439,7 +1466,7 @@ impl TransactionBuilder {
                                 return Err(JsError::from_str("Not enough ADA leftover to include non-ADA assets in a change address"));
                             }
                             change_left = change_left.checked_sub(&change_value)?;
-                            self.add_output(&change_output)?;
+                            self.add_change_output(&change_output)?;
                         }
                     }
                     change_left = change_left.checked_sub(&Value::new(&new_fee))?;
@@ -1457,7 +1484,7 @@ impl TransactionBuilder {
                         if potential_pure_above_minimum {
                             new_fee = new_fee.checked_add(&additional_fee)?;
                             change_left = Value::zero();
-                            self.add_output(&TransactionOutput {
+                            self.add_change_output(&TransactionOutput {
                                 address: address.clone(),
                                 amount: potential_pure_value.clone(),
                                 data_hash: data_hash.clone(),
@@ -1499,7 +1526,7 @@ impl TransactionBuilder {
                                     // recall: min_fee assumed the fee was the maximum possible so we definitely have enough input to cover whatever fee it ends up being
                                     self.set_fee(&new_fee);
 
-                                    self.add_output(&TransactionOutput {
+                                    self.add_change_output(&TransactionOutput {
                                         address: address.clone(),
                                         amount: change_estimator.checked_sub(&Value::new(&new_fee.clone()))?,
                                         data_hash: data_hash.clone(),
@@ -1667,6 +1694,14 @@ impl TransactionBuilder {
         let mut self_copy = self.clone();
         self_copy.set_fee(&to_bignum(0x1_00_00_00_00));
         min_fee(&self_copy)
+    }
+
+    pub fn redeemers(&self) -> Redeemers {
+        if self.redeemers.is_some() {
+            return self.redeemers.clone().unwrap();
+        } else {
+            return Redeemers::new();
+        }
     }
 }
 

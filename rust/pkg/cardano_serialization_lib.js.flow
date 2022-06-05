@@ -5442,6 +5442,11 @@ declare export class TransactionBuilder {
   add_output(output: TransactionOutput): void;
 
   /**
+   * @param {TransactionOutput} output
+   */
+  add_change_output(output: TransactionOutput): void;
+
+  /**
    * calculates how much the fee would increase if you added a given output
    * @param {TransactionOutput} output
    * @returns {BigNum}
@@ -5773,6 +5778,11 @@ declare export class TransactionBuilder {
    * @returns {BigNum}
    */
   min_fee(): BigNum;
+
+  /**
+   * @returns {Redeemers}
+   */
+  redeemers(): Redeemers;
 }
 /**
  */
