@@ -489,6 +489,12 @@ impl TxInputsBuilder {
             None
         }
     }
+
+    pub fn index_of_input(&self, input: &TransactionInput) -> usize {
+        let mut inputs = self.inputs.values().map(|(ref tx_builder_input, _)| tx_builder_input.input.clone()).collect::<Vec<TransactionInput>>();
+        inputs.sort();
+        inputs.iter().position(|i| i == input).unwrap()
+    }
 }
 
 impl From<&TxInputsBuilder> for RequiredSignersSet {

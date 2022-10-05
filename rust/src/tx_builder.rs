@@ -121,21 +121,13 @@ fn fake_full_tx(
             Some(result)
         }
     };
-    let (plutus_scripts, plutus_data, redeemers) = {
-        if let Some(s) = tx_builder.get_combined_plutus_scripts() {
-            let (s, d, r) = s.collect();
-            (Some(s), Some(d), Some(r))
-        } else {
-            (None, None, None)
-        }
-    };
     let witness_set = TransactionWitnessSet {
         vkeys,
         native_scripts: tx_builder.get_combined_native_scripts(),
         bootstraps: bootstrap_keys,
-        plutus_scripts,
-        plutus_data,
-        redeemers,
+        plutus_scripts: tx_builder.plutus_scripts.clone(),
+        plutus_data: tx_builder.plutus_data.clone(),
+        redeemers: tx_builder.redeemers.clone(),
     };
     Ok(Transaction {
         body,
@@ -343,6 +335,7 @@ pub struct TransactionBuilder {
     inputs: TxInputsBuilder,
     collateral: TxInputsBuilder,
     outputs: TransactionOutputs,
+    change_output_indices: Vec<usize>,
     fee: Option<Coin>,
     ttl: Option<SlotBigNum>, // absolute slot number
     certs: Option<Certificates>,
@@ -353,6 +346,10 @@ pub struct TransactionBuilder {
     mint_scripts: Option<NativeScripts>,
     script_data_hash: Option<ScriptDataHash>,
     required_signers: Ed25519KeyHashes,
+    collateral_inputs: Option<TransactionInputs>,
+    plutus_data: Option<PlutusList>,
+    redeemers: Option<Redeemers>,
+    plutus_scripts: Option<PlutusScripts>,
     collateral_return: Option<TransactionOutput>,
     total_collateral: Option<Coin>,
     reference_inputs: HashSet<TransactionInput>,
@@ -919,6 +916,29 @@ impl TransactionBuilder {
         }
     }
 
+    pub fn add_change_output(&mut self, output: &TransactionOutput) -> Result<(), JsError> {
+        let value_size = output.amount.to_bytes().len();
+        if value_size > self.config.max_value_size as usize {
+            return Err(JsError::from_str(&format!(
+                "Maximum value size of {} exceeded. Found: {}",
+                self.config.max_value_size, value_size
+            )));
+        }
+        let min_ada = min_ada_for_output(&output, &self.config.utxo_cost())?;
+        if output.amount().coin() < min_ada {
+            Err(JsError::from_str(&format!(
+                "Value {} less than the minimum UTXO value {}",
+                from_bignum(&output.amount().coin()),
+                from_bignum(&min_ada)
+            )))
+        } else {
+            self.outputs.add(output);
+            let outputs_length = self.outputs.len();
+            self.change_output_indices.push(outputs_length - 1);
+            Ok(())
+        }
+    }
+
     /// calculates how much the fee would increase if you added a given output
     pub fn fee_for_output(&self, output: &TransactionOutput) -> Result<Coin, JsError> {
         let mut self_copy = self.clone();
@@ -1191,12 +1211,33 @@ impl TransactionBuilder {
         )
     }
 
+    pub fn set_collateral_inputs(&mut self, collateral: &TransactionInputs) {
+        self.collateral_inputs = Some(collateral.clone())
+    }
+
+    pub fn set_plutus_data(&mut self, plutus_data: &PlutusList) {
+        self.plutus_data = Some(plutus_data.clone());
+    }
+
+    pub fn set_redeemers(&mut self, redeemers: &Redeemers) {
+        self.redeemers = Some(redeemers.clone())
+    }
+
+    pub fn set_plutus_scripts(&mut self, plutus_scripts: &PlutusScripts) {
+        self.plutus_scripts = Some(plutus_scripts.clone())
+    }
+
+    pub fn index_of_input(&self, input: &TransactionInput) -> usize {
+        self.inputs.index_of_input(input)
+    }
+
     pub fn new(cfg: &TransactionBuilderConfig) -> Self {
         Self {
             config: cfg.clone(),
             inputs: TxInputsBuilder::new(),
             collateral: TxInputsBuilder::new(),
             outputs: TransactionOutputs::new(),
+            change_output_indices: Vec::new(),
             fee: None,
             ttl: None,
             certs: None,
@@ -1207,6 +1248,10 @@ impl TransactionBuilder {
             mint_scripts: None,
             script_data_hash: None,
             required_signers: Ed25519KeyHashes::new(),
+            collateral_inputs: None,
+            plutus_data: None,
+            redeemers: None,
+            plutus_scripts: None,
             collateral_return: None,
             total_collateral: None,
             reference_inputs: HashSet::new(),
@@ -1298,15 +1343,12 @@ impl TransactionBuilder {
     /// Editing inputs, outputs, mint, etc. after change been calculated
     /// might cause a mismatch in calculated fee versus the required fee
     pub fn add_change_if_needed(&mut self, address: &Address) -> Result<bool, JsError> {
-        let fee = match &self.fee {
-            None => self.min_fee(),
-            // generating the change output involves changing the fee
-            Some(_x) => {
-                return Err(JsError::from_str(
-                    "Cannot calculate change if fee was explicitly specified",
-                ))
-            }
-        }?;
+        // reset change outputs
+        for index in self.change_output_indices.iter() {
+            self.outputs.0.remove(*index);
+        }
+        self.change_output_indices = Vec::new();
+        let fee = self.min_fee()?;
 
         // note: can't add plutus data or data hash and script to change
         // because we don't know how many change outputs will need to be created
@@ -1540,7 +1582,7 @@ impl TransactionBuilder {
                                 return Err(JsError::from_str("Not enough ADA leftover to include non-ADA assets in a change address"));
                             }
                             change_left = change_left.checked_sub(&change_value)?;
-                            self.add_output(&change_output)?;
+                            self.add_change_output(&change_output)?;
                         }
                     }
                     change_left = change_left.checked_sub(&Value::new(&new_fee))?;
@@ -1561,7 +1603,7 @@ impl TransactionBuilder {
                         if potential_pure_above_minimum {
                             new_fee = new_fee.checked_add(&additional_fee)?;
                             change_left = Value::zero();
-                            self.add_output(&TransactionOutput {
+                            self.add_change_output(&TransactionOutput {
                                 address: address.clone(),
                                 amount: potential_pure_value.clone(),
                                 plutus_data: plutus_data.clone(),
@@ -1624,7 +1666,7 @@ impl TransactionBuilder {
                                     // recall: min_fee assumed the fee was the maximum possible so we definitely have enough input to cover whatever fee it ends up being
                                     self.set_fee(&new_fee);
 
-                                    self.add_output(&TransactionOutput {
+                                    self.add_change_output(&TransactionOutput {
                                         address: address.clone(),
                                         amount: change_estimator
                                             .checked_sub(&Value::new(&new_fee.clone()))?,
@@ -1682,6 +1724,14 @@ impl TransactionBuilder {
         Ok(())
     }
 
+    pub fn calc_script_data_hash2(&mut self, cost_models: &Costmdls) -> Result<(), JsError> {
+        self.script_data_hash = match &self.redeemers {
+            None => None,
+            Some(_) => Some(hash_script_data(&self.redeemers.clone().unwrap(), cost_models, self.plutus_data.clone()))
+        };
+        Ok(())
+    }
+
     /// Sets the specified hash value.
     /// Alternatively you can use `.calc_script_data_hash` to calculate the hash automatically.
     /// Or use `.remove_script_data_hash` to delete the previously set value
@@ -1718,8 +1768,8 @@ impl TransactionBuilder {
             validity_start_interval: self.validity_start_interval,
             mint: self.mint.clone(),
             script_data_hash: self.script_data_hash.clone(),
-            collateral: self.collateral.inputs_option(),
             required_signers: self.required_signers.to_option(),
+            collateral: self.collateral_inputs.clone(),
             network_id: None,
             collateral_return: self.collateral_return.clone(),
             total_collateral: self.total_collateral.clone(),
@@ -1780,6 +1830,7 @@ impl TransactionBuilder {
 
     fn get_combined_plutus_scripts(&self) -> Option<PlutusWitnesses> {
         let mut res = PlutusWitnesses::new();
+
         if let Some(scripts) = self.inputs.get_plutus_input_scripts() {
             scripts.0.iter().for_each(|s| {
                 res.add(s);
@@ -1861,6 +1912,14 @@ impl TransactionBuilder {
         let mut self_copy = self.clone();
         self_copy.set_fee(&to_bignum(0x1_00_00_00_00));
         min_fee(&self_copy)
+    }
+
+    pub fn redeemers(&self) -> Redeemers {
+        if self.redeemers.is_some() {
+            return self.redeemers.clone().unwrap();
+        } else {
+            return Redeemers::new();
+        }
     }
 }
 
