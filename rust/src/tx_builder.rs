@@ -6472,29 +6472,48 @@ mod tests {
                 &TransactionInput::new(&genesis_id(), 0),
                 &Value::new(&to_bignum(1_000_000)),
             );
+
             collateral_builder.add_input(
                 &fake_base_address(0),
                 &TransactionInput::new(&genesis_id(), 1),
                 &Value::new(&to_bignum(1_000_000)),
             );
 
+            input_builder.add_input(
+                &fake_base_address(0),
+                &TransactionInput::new(&genesis_id(), 2),
+                &Value::new(&to_bignum(1_000_000)),
+            );
+
+            let collateral_inputs = collateral_builder.inputs();
+
             let (pscript1, _) = plutus_script_and_hash(0);
+
             let datum1 = PlutusData::new_bytes(fake_bytes_32(10));
+
             let redeemer1 = Redeemer::new(
                 &RedeemerTag::new_spend(),
                 &to_bignum(0),
                 &PlutusData::new_bytes(fake_bytes_32(20)),
                 &ExUnits::new(&to_bignum(mem), &to_bignum(step)),
             );
-            input_builder.add_plutus_script_input(
-                &PlutusWitness::new(&pscript1, &datum1, &redeemer1),
-                &TransactionInput::new(&genesis_id(), 2),
-                &Value::new(&to_bignum(1_000_000)),
-            );
+
+            let mut scripts = PlutusScripts::new();
+            scripts.add(&pscript1);
+
+            let mut datums = PlutusList::new();
+            datums.add(&datum1);
+
+            let mut redeemers = Redeemers::new();
+            redeemers.add(&redeemer1);
 
             let mut tx_builder = create_reallistic_tx_builder();
+
             tx_builder.set_inputs(&input_builder);
-            tx_builder.set_collateral(&collateral_builder);
+            tx_builder.set_collateral_inputs(&collateral_inputs);
+            tx_builder.set_plutus_scripts(&scripts);
+            tx_builder.set_plutus_data(&datums);
+            tx_builder.set_redeemers(&redeemers);
 
             tx_builder
                 .add_change_if_needed(&fake_base_address(42))
